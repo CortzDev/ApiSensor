@@ -152,25 +152,26 @@ def create_tables_if_not_exist():
       - sensor_readings (raw)
       - sensor_snapshot (opcional para últimas raw)
       - sensor_metrics (columnar)
+    NOTA: usamos TIMESTAMP (sin zona) para guardar la hora local de El Salvador.
     """
     create_sql = """
     CREATE TABLE IF NOT EXISTS sensor_readings (
         id SERIAL PRIMARY KEY,
         device_id TEXT,
-        recorded_at TIMESTAMPTZ NOT NULL,
+        recorded_at TIMESTAMP NOT NULL,
         raw JSONB NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS sensor_snapshot (
         device_id TEXT PRIMARY KEY,
-        last_recorded_at TIMESTAMPTZ NOT NULL,
+        last_recorded_at TIMESTAMP NOT NULL,
         raw JSONB NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS sensor_metrics (
         id SERIAL PRIMARY KEY,
         device_id TEXT,
-        recorded_at TIMESTAMPTZ NOT NULL,
+        recorded_at TIMESTAMP NOT NULL,
         air_quality_index TEXT,
         temp_current DOUBLE PRECISION,
         humidity_value DOUBLE PRECISION,
@@ -252,13 +253,15 @@ def save_full_reading(device_id, full_data):
         except Exception:
             pass
 
+        # Al guardar en TIMESTAMP, PostgreSQL lo guardará como "2025-11-18 19:52:04"
+        # (sin info de zona, ya en hora local)
         raw_json = json.dumps(full_data, default=str)
 
         # 1) Insert raw reading
         cur.execute(
             "INSERT INTO sensor_readings (device_id, recorded_at, raw) "
             "VALUES (%s, %s, %s::jsonb) RETURNING id;",
-            (device_id, recorded_at, raw_json)
+            (device_id, recorded_at.replace(tzinfo=None), raw_json)
         )
         reading_id = cur.fetchone()[0]
 
@@ -300,7 +303,7 @@ def save_full_reading(device_id, full_data):
             RETURNING id;
             """,
             (
-                device_id, recorded_at,
+                device_id, recorded_at.replace(tzinfo=None),
                 cols["air_quality_index"], cols["temp_current"], cols["humidity_value"], cols["co2_value"],
                 cols["ch2o_value"], cols["pm25_value"], cols["pm1"], cols["pm10"],
                 cols["battery_percentage"], cols["charge_state"], raw_json
@@ -317,7 +320,7 @@ def save_full_reading(device_id, full_data):
               SET last_recorded_at = EXCLUDED.last_recorded_at,
                   raw = EXCLUDED.raw;
             """,
-            (device_id, recorded_at, raw_json)
+            (device_id, recorded_at.replace(tzinfo=None), raw_json)
         )
 
         conn.commit()
@@ -326,7 +329,7 @@ def save_full_reading(device_id, full_data):
             "success": True,
             "reading_id": reading_id,
             "metric_id": metric_id,
-            "recorded_at": recorded_at.isoformat()
+            "recorded_at": recorded_at.strftime("%Y-%m-%d %H:%M:%S")
         }
     except Exception as e:
         if conn:
@@ -505,7 +508,8 @@ def latest_metrics():
         if not row:
             return jsonify({"success": True, "device_id": device_id, "metrics": None})
         if row.get("recorded_at"):
-            row["recorded_at"] = row["recorded_at"].isoformat()
+            # Formato que pediste: 2025-11-18 19:52:04
+            row["recorded_at"] = row["recorded_at"].strftime("%Y-%m-%d %H:%M:%S")
         return jsonify({"success": True, "device_id": device_id, "metrics": row})
     except Exception as e:
         traceback.print_exc()
@@ -520,6 +524,12 @@ def snapshots():
         rows = cur.fetchall()
         cur.close()
         conn.close()
+
+        # Convertimos last_recorded_at a string legible también
+        for r in rows:
+            if r.get("last_recorded_at"):
+                r["last_recorded_at"] = r["last_recorded_at"].strftime("%Y-%m-%d %H:%M:%S")
+
         return jsonify({"success": True, "snapshots": rows})
     except Exception as e:
         traceback.print_exc()
