@@ -1,4 +1,4 @@
-# app_full_sensors_columns.py
+# app.py
 # API completa: mantiene tus endpoints originales + guardado columnar + job periódico cada 10min
 
 from flask import Flask, jsonify, request
@@ -563,7 +563,7 @@ _init_lock = threading.Lock()
 
 def init_background():
     """
-    Se ejecuta una sola vez, tanto en local como en Railway:
+    Se ejecuta una sola vez POR PROCESO:
     - Crea tablas en PostgreSQL
     - Obtiene token inicial de Tuya
     - Lanza el job periódico de guardado
@@ -586,16 +586,14 @@ def init_background():
         print(f"⏱️ Hilo de guardado periódico iniciado (cada {SAVE_INTERVAL_SECONDS} segundos)")
         _initialized = True
 
-@app.before_first_request
-def startup_event():
-    # Esto se ejecuta en Railway cuando llega la primera petición HTTP
-    init_background()
+# --- IMPORTANTE: llamar init_background al importar el módulo (para gunicorn) ---
+init_background()
 
 # -------------------------
 # Ejecución local (python app.py)
 # -------------------------
 if __name__ == "__main__":
-    init_background()
+    # Ya se llamó init_background() arriba, no es necesario repetirlo
     port = int(os.environ.get("PORT", 5000))
     print(f"Escuchando en puerto {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
