@@ -1,5 +1,6 @@
 # app_full_sensors_columns.py
 # API completa: mantiene tus endpoints originales + guardado columnar + job periódico cada 10min
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import hashlib
@@ -8,6 +9,7 @@ import time
 import requests
 import threading
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import os
 import psycopg2
 import psycopg2.extras
@@ -18,16 +20,21 @@ app = Flask(__name__)
 CORS(app)
 
 # -------------------------
-# CONFIG: Tuya
+# CONFIG: Tuya (usa env vars si existen)
 # -------------------------
-CLIENT_ID = "dhd4knqghttrtrx3n5vu"
-ACCESS_SECRET = "d51e817b7fec4b6091b51a2cc3c323d5"
-DEVICE_ID = "bf9b2ec293a9f9b528lkdl"
+CLIENT_ID = os.getenv("TUYA_CLIENT_ID", "dhd4knqghttrtrx3n5vu")
+ACCESS_SECRET = os.getenv("TUYA_ACCESS_SECRET", "d51e817b7fec4b6091b51a2cc3c323d5")
+DEVICE_ID = os.getenv("TUYA_DEVICE_ID", "bf9b2ec293a9f9b528lkdl")
 
 # -------------------------
-# CONFIG: Database (tu URL)
+# CONFIG: Database (PostgreSQL)
+# Railway suele exponer DATABASE_URL en las variables de entorno.
+# Dejamos tu URL como valor por defecto por si no está seteada.
 # -------------------------
-DATABASE_URL = "postgresql://postgres:VaLqxGBzdzZmBTddchzzryKgNeQmoPfI@switchback.proxy.rlwy.net:14573/railway?sslmode=require"
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:VaLqxGBzdzZmBTddchzzryKgNeQmoPfI@switchback.proxy.rlwy.net:14573/railway?sslmode=require"
+)
 
 # -------------------------
 # TOKEN MANAGEMENT (Tuya) - thread-safe
@@ -136,7 +143,7 @@ def get_tuya_data():
 # DB utilities
 # -------------------------
 def db_connect():
-    # psycopg2 acepta la URL directamente
+    # psycopg2 acepta la URL directamente (PostgreSQL)
     return psycopg2.connect(DATABASE_URL)
 
 def create_tables_if_not_exist():
@@ -144,7 +151,7 @@ def create_tables_if_not_exist():
     Crea:
       - sensor_readings (raw)
       - sensor_snapshot (opcional para últimas raw)
-      - sensor_metrics (columnar según confirmación)
+      - sensor_metrics (columnar)
     """
     create_sql = """
     CREATE TABLE IF NOT EXISTS sensor_readings (
@@ -187,7 +194,7 @@ def create_tables_if_not_exist():
         cur.execute(create_sql)
         conn.commit()
         cur.close()
-        print("✅ Tablas verificadas/creadas.")
+        print("✅ Tablas verificadas/creadas en PostgreSQL.")
     except Exception as e:
         print("⚠️ Error creando tablas:", e)
         traceback.print_exc()
@@ -235,12 +242,22 @@ def save_full_reading(device_id, full_data):
     try:
         conn = db_connect()
         cur = conn.cursor()
+
+        # timestamp base (Tuya en ms -> UTC)
         recorded_at = parse_recorded_at_from_response(full_data)
+
+        # Convertir a hora de El Salvador (UTC-6)
+        try:
+            recorded_at = recorded_at.astimezone(ZoneInfo("America/El_Salvador"))
+        except Exception:
+            pass
+
         raw_json = json.dumps(full_data, default=str)
 
         # 1) Insert raw reading
         cur.execute(
-            "INSERT INTO sensor_readings (device_id, recorded_at, raw) VALUES (%s, %s, %s::jsonb) RETURNING id;",
+            "INSERT INTO sensor_readings (device_id, recorded_at, raw) "
+            "VALUES (%s, %s, %s::jsonb) RETURNING id;",
             (device_id, recorded_at, raw_json)
         )
         reading_id = cur.fetchone()[0]
@@ -260,15 +277,13 @@ def save_full_reading(device_id, full_data):
                 cols[col] = float(val)
             elif isinstance(val, str):
                 s = val.strip()
-                # detectar booleans en string
                 if s.lower() in ("true", "false"):
                     cols[col] = (s.lower() == "true")
                 else:
-                    # intentar parsear número
                     try:
                         num = float(s)
                         cols[col] = num
-                    except:
+                    except Exception:
                         cols[col] = s
             else:
                 cols[col] = None
@@ -307,12 +322,17 @@ def save_full_reading(device_id, full_data):
 
         conn.commit()
         cur.close()
-        return {"success": True, "reading_id": reading_id, "metric_id": metric_id, "recorded_at": recorded_at.isoformat()}
+        return {
+            "success": True,
+            "reading_id": reading_id,
+            "metric_id": metric_id,
+            "recorded_at": recorded_at.isoformat()
+        }
     except Exception as e:
         if conn:
             try:
                 conn.rollback()
-            except:
+            except Exception:
                 pass
         traceback.print_exc()
         return {"success": False, "error": str(e)}
@@ -335,7 +355,10 @@ def periodic_save_job():
             else:
                 result = save_full_reading(DEVICE_ID, data)
                 if result.get("success"):
-                    print(f"✅ Guardado periódico: reading_id={result['reading_id']} metric_id={result['metric_id']} at {result['recorded_at']}")
+                    print(
+                        f"✅ Guardado periódico: reading_id={result['reading_id']} "
+                        f"metric_id={result['metric_id']} at {result['recorded_at']}"
+                    )
                 else:
                     print("⚠️ Error guardando (periódico):", result.get("error"))
         except Exception as e:
@@ -344,7 +367,7 @@ def periodic_save_job():
         time.sleep(SAVE_INTERVAL_SECONDS)
 
 # -------------------------
-# Endpoints originales (sin cambios funcionales)
+# Endpoints originales
 # -------------------------
 @app.route('/api/sensors', methods=['GET'])
 def get_sensors():
@@ -380,7 +403,10 @@ def get_sensors_formatted():
         for item in data['result']:
             sensor = {
                 "code": item.get('code'),
-                "name": sensor_names.get(item.get('code'), item.get('code', '').replace('_', ' ').title()),
+                "name": sensor_names.get(
+                    item.get('code'),
+                    item.get('code', '').replace('_', ' ').title()
+                ),
                 "value": item.get('value'),
                 "type": type(item.get('value')).__name__
             }
@@ -421,7 +447,11 @@ def refresh_token():
     if "error" in token_result:
         return jsonify({"success": False, "error": token_result["error"]}), 400
 
-    return jsonify({"success": True, "message": "Token renovado exitosamente", "expires_at": token_expires_at.isoformat()})
+    return jsonify({
+        "success": True,
+        "message": "Token renovado exitosamente",
+        "expires_at": token_expires_at.isoformat()
+    })
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -466,7 +496,8 @@ def latest_metrics():
             WHERE device_id = %s
             ORDER BY recorded_at DESC
             LIMIT 1;
-            """, (device_id,)
+            """,
+            (device_id,)
         )
         row = cur.fetchone()
         cur.close()
@@ -495,7 +526,7 @@ def snapshots():
         return jsonify({"success": False, "error": str(e)}), 500
 
 # -------------------------
-# Root: mantener JSON de info original (con endpoints y features)
+# Root: info básica API
 # -------------------------
 @app.route('/', methods=['GET'])
 def api_info():
@@ -505,41 +536,66 @@ def api_info():
         "features": [
             "Renovación automática de tokens",
             "Manejo thread-safe de tokens",
-            "Endpoints para gestión de tokens"
+            "Guardado en PostgreSQL (raw + columnar)",
+            "Job periódico cada 10 minutos"
         ],
         "endpoints": {
             "/api/sensors": "Obtiene datos raw de sensores",
             "/api/sensors/formatted": "Obtiene datos formateados de sensores",
             "/api/token": "Información del token actual",
             "/api/token/refresh": "Renueva el token manualmente",
-            "/api/health": "Estado de la API y token"
+            "/api/health": "Estado de la API y token",
+            "/api/save-now": "Forza un guardado inmediato en BD",
+            "/api/latest-metrics": "Último registro columnar",
+            "/api/snapshots": "Último raw por dispositivo"
         },
         "usage": {
-            "base_url": "http://localhost:5000",
             "cors": "Habilitado para todos los dominios",
             "methods": ["GET", "POST"]
         }
     })
 
 # -------------------------
-# Startup: crear tablas, obtener token y lanzar job periódico
+# Inicialización para Railway / Gunicorn
+# -------------------------
+_initialized = False
+_init_lock = threading.Lock()
+
+def init_background():
+    """
+    Se ejecuta una sola vez, tanto en local como en Railway:
+    - Crea tablas en PostgreSQL
+    - Obtiene token inicial de Tuya
+    - Lanza el job periódico de guardado
+    """
+    global _initialized
+    with _init_lock:
+        if _initialized:
+            return
+        print("🚀 Inicializando BD y job periódico...")
+        create_tables_if_not_exist()
+
+        initial = ensure_valid_token()
+        if "error" in initial:
+            print("⚠️ No se pudo obtener token inicial:", initial["error"])
+        else:
+            print("✅ Token inicial obtenido")
+
+        t = threading.Thread(target=periodic_save_job, daemon=True)
+        t.start()
+        print(f"⏱️ Hilo de guardado periódico iniciado (cada {SAVE_INTERVAL_SECONDS} segundos)")
+        _initialized = True
+
+@app.before_first_request
+def startup_event():
+    # Esto se ejecuta en Railway cuando llega la primera petición HTTP
+    init_background()
+
+# -------------------------
+# Ejecución local (python app.py)
 # -------------------------
 if __name__ == "__main__":
-    print("🚀 Tuya Sensors API (columnar) iniciando...")
-    create_tables_if_not_exist()
-
-    # token inicial (no crítico)
-    initial = ensure_valid_token()
-    if "error" in initial:
-        print("⚠️ No se pudo obtener token inicial:", initial["error"])
-    else:
-        print("✅ Token inicial obtenido")
-
-    # lanzar job periódico en background (daemon)
-    t = threading.Thread(target=periodic_save_job, daemon=True)
-    t.start()
-    print(f"⏱️ Hilo de guardado periódico iniciado (cada {SAVE_INTERVAL_SECONDS} segundos)")
-
+    init_background()
     port = int(os.environ.get("PORT", 5000))
     print(f"Escuchando en puerto {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
