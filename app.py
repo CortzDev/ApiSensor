@@ -1,5 +1,5 @@
 # app.py
-# API completa: mantiene tus endpoints originales + guardado columnar + job periódico cada 10min
+# API unificada: Tuya IoT + Background Jobs + Análisis de Métricas con Pandas
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -15,9 +15,11 @@ import psycopg2
 import psycopg2.extras
 import json
 import traceback
+import pandas as pd # <-- Importado de tu API de métricas
 
 app = Flask(__name__)
-CORS(app)
+# Configuración de CORS permitiendo todo (basado en tu FastAPI)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # -------------------------
 # CONFIG: Tuya (usa env vars si existen)
@@ -28,8 +30,6 @@ DEVICE_ID = os.getenv("TUYA_DEVICE_ID", "bf9b2ec293a9f9b528lkdl")
 
 # -------------------------
 # CONFIG: Database (PostgreSQL)
-# Railway suele exponer DATABASE_URL en las variables de entorno.
-# Dejamos tu URL como valor por defecto por si no está seteada.
 # -------------------------
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -118,9 +118,6 @@ def calculate_tuya_signature(access_token, method="GET", url_path="/v1.0/devices
         "sign": signature
     }
 
-# -------------------------
-# TUYA: obtener estado del dispositivo
-# -------------------------
 def get_tuya_data():
     token_result = ensure_valid_token()
     if "error" in token_result:
@@ -132,7 +129,6 @@ def get_tuya_data():
     try:
         response = requests.get(url, headers=headers, timeout=10)
         data = response.json() if response.text else {}
-        # opcional: filtrar códigos no deseados
         if 'result' in data and data['result']:
             data['result'] = [item for item in data['result'] if item.get('code') != 'alarm_volume']
         return data
@@ -143,17 +139,9 @@ def get_tuya_data():
 # DB utilities
 # -------------------------
 def db_connect():
-    # psycopg2 acepta la URL directamente (PostgreSQL)
     return psycopg2.connect(DATABASE_URL)
 
 def create_tables_if_not_exist():
-    """
-    Crea:
-      - sensor_readings (raw)
-      - sensor_snapshot (opcional para últimas raw)
-      - sensor_metrics (columnar)
-    NOTA: usamos TIMESTAMP (sin zona) para guardar la hora local de El Salvador.
-    """
     create_sql = """
     CREATE TABLE IF NOT EXISTS sensor_readings (
         id SERIAL PRIMARY KEY,
@@ -203,9 +191,6 @@ def create_tables_if_not_exist():
         if conn:
             conn.close()
 
-# -------------------------
-# Helpers: timestamp
-# -------------------------
 def parse_recorded_at_from_response(resp):
     ts_ms = resp.get("t")
     try:
@@ -215,9 +200,6 @@ def parse_recorded_at_from_response(resp):
         pass
     return datetime.now(timezone.utc)
 
-# -------------------------
-# Mapeo code -> columna
-# -------------------------
 CODE_TO_COLUMN = {
     "air_quality_index": "air_quality_index",
     "temp_current": "temp_current",
@@ -231,33 +213,20 @@ CODE_TO_COLUMN = {
     "charge_state": "charge_state"
 }
 
-# -------------------------
-# Lógica de guardado: raw + columnar
-# -------------------------
 def save_full_reading(device_id, full_data):
-    """
-    Guarda en sensor_readings (raw), sensor_metrics (columnar) y actualiza sensor_snapshot.
-    Retorna dict con success y detalles.
-    """
     conn = None
     try:
         conn = db_connect()
         cur = conn.cursor()
-
-        # timestamp base (Tuya en ms -> UTC)
         recorded_at = parse_recorded_at_from_response(full_data)
 
-        # Convertir a hora de El Salvador (UTC-6)
         try:
             recorded_at = recorded_at.astimezone(ZoneInfo("America/El_Salvador"))
         except Exception:
             pass
 
-        # Al guardar en TIMESTAMP, PostgreSQL lo guardará como "2025-11-18 19:52:04"
-        # (sin info de zona, ya en hora local)
         raw_json = json.dumps(full_data, default=str)
 
-        # 1) Insert raw reading
         cur.execute(
             "INSERT INTO sensor_readings (device_id, recorded_at, raw) "
             "VALUES (%s, %s, %s::jsonb) RETURNING id;",
@@ -265,7 +234,6 @@ def save_full_reading(device_id, full_data):
         )
         reading_id = cur.fetchone()[0]
 
-        # 2) Preparar columnas para sensor_metrics
         cols = {col: None for col in CODE_TO_COLUMN.values()}
         items = full_data.get("result") or []
         for it in items:
@@ -291,7 +259,6 @@ def save_full_reading(device_id, full_data):
             else:
                 cols[col] = None
 
-        # 3) Insertar fila columnar
         cur.execute(
             """
             INSERT INTO sensor_metrics
@@ -311,7 +278,6 @@ def save_full_reading(device_id, full_data):
         )
         metric_id = cur.fetchone()[0]
 
-        # 4) Upsert snapshot (raw)
         cur.execute(
             """
             INSERT INTO sensor_snapshot (device_id, last_recorded_at, raw)
@@ -346,7 +312,7 @@ def save_full_reading(device_id, full_data):
 # -------------------------
 # JOB periódico (cada 10 minutos)
 # -------------------------
-SAVE_INTERVAL_SECONDS = 10 * 60  # 10 minutos
+SAVE_INTERVAL_SECONDS = 10 * 60
 
 def periodic_save_job():
     while True:
@@ -370,11 +336,55 @@ def periodic_save_job():
         time.sleep(SAVE_INTERVAL_SECONDS)
 
 # -------------------------
-# Endpoints originales
+# ENDPOINTS
 # -------------------------
+
+# NUEVO: Endpoint integrado desde FastAPI usando pandas
+@app.route('/api/metrics', methods=['GET'])
+def get_metrics():
+    """Obtiene los datos de sensor_metrics filtrados por fecha para las gráficas."""
+    # En Flask, los query params se obtienen de request.args
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    limit = request.args.get('limit', type=int)
+
+    try:
+        conn = db_connect()
+        
+        query = """
+            SELECT recorded_at, temp_current, humidity_value, co2_value, 
+                   ch2o_value, pm25_value, pm1, pm10, battery_percentage 
+            FROM sensor_metrics 
+            WHERE 1=1
+        """
+        params = []
+        
+        if start_date:
+            query += " AND recorded_at >= %s"
+            params.append(start_date)
+        if end_date:
+            query += " AND recorded_at <= %s"
+            params.append(end_date)
+            
+        if limit is not None:
+            query += f" ORDER BY recorded_at DESC LIMIT {limit}"
+            df = pd.read_sql(query, conn, params=params)
+            df = df.sort_values(by='recorded_at', ascending=True)
+        else:
+            query += " ORDER BY recorded_at ASC"
+            df = pd.read_sql(query, conn, params=params)
+            
+        conn.close()
+        
+        if not df.empty:
+            df['recorded_at'] = pd.to_datetime(df['recorded_at']).dt.strftime('%Y-%m-%dT%H:%M:%S')
+        
+        return jsonify({"data": df.to_dict(orient='records')})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route('/api/sensors', methods=['GET'])
 def get_sensors():
-    """Obtiene datos raw de sensores (tal cual desde Tuya)"""
     return jsonify(get_tuya_data())
 
 @app.route('/api/sensors/formatted', methods=['GET'])
@@ -420,12 +430,8 @@ def get_sensors_formatted():
 @app.route('/api/token', methods=['GET'])
 def get_token_info():
     global current_token, token_expires_at
-
     if not current_token or not token_expires_at:
-        return jsonify({
-            "status": "no_token",
-            "message": "No hay token activo"
-        })
+        return jsonify({"status": "no_token", "message": "No hay token activo"})
 
     now = datetime.now(timezone.utc)
     is_valid = now < token_expires_at
@@ -441,7 +447,6 @@ def get_token_info():
 @app.route('/api/token/refresh', methods=['POST'])
 def refresh_token():
     global current_token, token_expires_at
-
     with token_lock:
         current_token = None
         token_expires_at = None
@@ -459,7 +464,6 @@ def refresh_token():
 @app.route('/api/health', methods=['GET'])
 def health_check():
     global current_token, token_expires_at
-
     token_status = "valid"
     if not current_token:
         token_status = "no_token"
@@ -473,9 +477,6 @@ def health_check():
         "token_status": token_status
     })
 
-# -------------------------
-# Nuevos endpoints para guardado y consulta columnar
-# -------------------------
 @app.route('/api/save-now', methods=['POST', 'GET'])
 def save_now():
     data = get_tuya_data()
@@ -508,7 +509,6 @@ def latest_metrics():
         if not row:
             return jsonify({"success": True, "device_id": device_id, "metrics": None})
         if row.get("recorded_at"):
-            # Formato que pediste: 2025-11-18 19:52:04
             row["recorded_at"] = row["recorded_at"].strftime("%Y-%m-%d %H:%M:%S")
         return jsonify({"success": True, "device_id": device_id, "metrics": row})
     except Exception as e:
@@ -525,7 +525,6 @@ def snapshots():
         cur.close()
         conn.close()
 
-        # Convertimos last_recorded_at a string legible también
         for r in rows:
             if r.get("last_recorded_at"):
                 r["last_recorded_at"] = r["last_recorded_at"].strftime("%Y-%m-%d %H:%M:%S")
@@ -535,21 +534,20 @@ def snapshots():
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
-# -------------------------
-# Root: info básica API
-# -------------------------
 @app.route('/', methods=['GET'])
 def api_info():
     return jsonify({
         "name": "Tuya Sensors API",
-        "version": "2.0",
+        "version": "2.1",
         "features": [
             "Renovación automática de tokens",
             "Manejo thread-safe de tokens",
             "Guardado en PostgreSQL (raw + columnar)",
-            "Job periódico cada 10 minutos"
+            "Job periódico cada 10 minutos",
+            "Consulta de métricas históricas filtradas"
         ],
         "endpoints": {
+            "/api/metrics": "Obtiene los datos históricos filtrados por fecha y límite para gráficas",
             "/api/sensors": "Obtiene datos raw de sensores",
             "/api/sensors/formatted": "Obtiene datos formateados de sensores",
             "/api/token": "Información del token actual",
@@ -572,12 +570,6 @@ _initialized = False
 _init_lock = threading.Lock()
 
 def init_background():
-    """
-    Se ejecuta una sola vez POR PROCESO:
-    - Crea tablas en PostgreSQL
-    - Obtiene token inicial de Tuya
-    - Lanza el job periódico de guardado
-    """
     global _initialized
     with _init_lock:
         if _initialized:
@@ -596,14 +588,9 @@ def init_background():
         print(f"⏱️ Hilo de guardado periódico iniciado (cada {SAVE_INTERVAL_SECONDS} segundos)")
         _initialized = True
 
-# --- IMPORTANTE: llamar init_background al importar el módulo (para gunicorn) ---
 init_background()
 
-# -------------------------
-# Ejecución local (python app.py)
-# -------------------------
 if __name__ == "__main__":
-    # Ya se llamó init_background() arriba, no es necesario repetirlo
     port = int(os.environ.get("PORT", 5000))
     print(f"Escuchando en puerto {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
