@@ -1,5 +1,3 @@
-# app.py
-# API unificada: Tuya IoT + Background Jobs + Análisis de Métricas con Pandas
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -15,18 +13,30 @@ import psycopg2
 import psycopg2.extras
 import json
 import traceback
-import pandas as pd # <-- Importado de tu API de métricas
+import pandas as pd
 
 app = Flask(__name__)
-# Configuración de CORS permitiendo todo (basado en tu FastAPI)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # -------------------------
-# CONFIG: Tuya (usa env vars si existen)
+# CONFIG: IDs de Dispositivos
+# -------------------------
+ID_CARA_SUCIA = os.getenv("TUYA_DEVICE_ID", "bf9b2ec293a9f9b528lkdl")
+ID_NAHUIZALCO = "bfbb9424274a58f7c805lh"
+ID_JUAYUA     = "bfc04053ebf458efd9dil7"
+
+# Mapeo para facilitar la lectura en la API
+SENSORS_MAP = {
+    ID_CARA_SUCIA: "Cara Sucia (Estudio Principal)",
+    ID_NAHUIZALCO: "Nahuizalco (Tiempo Real)",
+    ID_JUAYUA:     "Juayúa (Tiempo Real)"
+}
+
+# -------------------------
+# CONFIG: Tuya Auth
 # -------------------------
 CLIENT_ID = os.getenv("TUYA_CLIENT_ID", "dhd4knqghttrtrx3n5vu")
 ACCESS_SECRET = os.getenv("TUYA_ACCESS_SECRET", "d51e817b7fec4b6091b51a2cc3c323d5")
-DEVICE_ID = os.getenv("TUYA_DEVICE_ID", "bf9b2ec293a9f9b528lkdl")
 
 # -------------------------
 # CONFIG: Database (PostgreSQL)
@@ -37,7 +47,7 @@ DATABASE_URL = os.getenv(
 )
 
 # -------------------------
-# TOKEN MANAGEMENT (Tuya) - thread-safe
+# TOKEN MANAGEMENT (Tuya)
 # -------------------------
 current_token = None
 token_expires_at = None
@@ -69,18 +79,14 @@ def get_tuya_token():
     try:
         response = requests.get(url, headers=headers, timeout=10)
         data = response.json() if response.text else {}
-        if response.status_code == 200:
-            if data.get("success") and "result" in data:
-                return {
-                    "token": data["result"]["access_token"],
-                    "expires_in": data["result"].get("expire_time", 7200)
-                }
-            else:
-                return {"error": f"Error en respuesta de Tuya: {data}"}
-        else:
-            return {"error": f"HTTP {response.status_code}: {response.text}"}
+        if response.status_code == 200 and data.get("success"):
+            return {
+                "token": data["result"]["access_token"],
+                "expires_in": data["result"].get("expire_time", 7200)
+            }
+        return {"error": f"Error Tuya: {data}"}
     except Exception as e:
-        return {"error": f"Error al obtener token: {str(e)}"}
+        return {"error": str(e)}
 
 def ensure_valid_token():
     global current_token, token_expires_at
@@ -90,19 +96,17 @@ def ensure_valid_token():
             print("🔄 Renovando token Tuya...")
             token_result = get_tuya_token()
             if "error" in token_result:
-                print("⚠️ Error renovando token:", token_result["error"])
                 return token_result
             current_token = token_result["token"]
             token_expires_at = now + timedelta(seconds=token_result["expires_in"])
-            print("✅ Token renovado. Expira:", token_expires_at.isoformat())
+            print(f"✅ Token renovado. Expira: {token_expires_at.isoformat()}")
         return {"token": current_token}
 
-def calculate_tuya_signature(access_token, method="GET", url_path="/v1.0/devices", body=""):
+def calculate_tuya_signature(access_token, method, url_path, body=""):
     timestamp = str(int(time.time() * 1000))
-    nonce = ""
     content_sha256 = hashlib.sha256(body.encode()).hexdigest()
     string_to_sign = f"{method}\n{content_sha256}\n\n{url_path}"
-    str_to_sign = CLIENT_ID + access_token + timestamp + nonce + string_to_sign
+    str_to_sign = CLIENT_ID + access_token + timestamp + "" + string_to_sign
     signature = hmac.new(
         ACCESS_SECRET.encode(),
         str_to_sign.encode(),
@@ -118,479 +122,189 @@ def calculate_tuya_signature(access_token, method="GET", url_path="/v1.0/devices
         "sign": signature
     }
 
-def get_tuya_data():
+# -------------------------
+# FUNCIÓN CORE: Obtener datos de CUALQUIER sensor
+# -------------------------
+def get_tuya_data(device_id):
     token_result = ensure_valid_token()
-    if "error" in token_result:
-        return token_result
+    if "error" in token_result: return token_result
+    
     access_token = token_result["token"]
-    url_path = f"/v1.0/devices/{DEVICE_ID}/status"
+    url_path = f"/v1.0/devices/{device_id}/status"
     headers = calculate_tuya_signature(access_token, "GET", url_path)
     url = f"https://openapi.tuyaeu.com{url_path}"
+    
     try:
         response = requests.get(url, headers=headers, timeout=10)
         data = response.json() if response.text else {}
         if 'result' in data and data['result']:
+            # Limpiar ruidos innecesarios como alarm_volume
             data['result'] = [item for item in data['result'] if item.get('code') != 'alarm_volume']
         return data
     except Exception as e:
-        return {"error": f"Error al conectar con Tuya: {str(e)}", "success": False}
+        return {"error": str(e), "success": False}
 
 # -------------------------
-# DB utilities
+# DB Utilities
 # -------------------------
 def db_connect():
     return psycopg2.connect(DATABASE_URL)
 
 def create_tables_if_not_exist():
     create_sql = """
-    CREATE TABLE IF NOT EXISTS sensor_readings (
-        id SERIAL PRIMARY KEY,
-        device_id TEXT,
-        recorded_at TIMESTAMP NOT NULL,
-        raw JSONB NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS sensor_snapshot (
-        device_id TEXT PRIMARY KEY,
-        last_recorded_at TIMESTAMP NOT NULL,
-        raw JSONB NOT NULL
-    );
-
+    CREATE TABLE IF NOT EXISTS sensor_readings (id SERIAL PRIMARY KEY, device_id TEXT, recorded_at TIMESTAMP NOT NULL, raw JSONB NOT NULL);
+    CREATE TABLE IF NOT EXISTS sensor_snapshot (device_id TEXT PRIMARY KEY, last_recorded_at TIMESTAMP NOT NULL, raw JSONB NOT NULL);
     CREATE TABLE IF NOT EXISTS sensor_metrics (
-        id SERIAL PRIMARY KEY,
-        device_id TEXT,
-        recorded_at TIMESTAMP NOT NULL,
-        air_quality_index TEXT,
-        temp_current DOUBLE PRECISION,
-        humidity_value DOUBLE PRECISION,
-        co2_value DOUBLE PRECISION,
-        ch2o_value DOUBLE PRECISION,
-        pm25_value DOUBLE PRECISION,
-        pm1 DOUBLE PRECISION,
-        pm10 DOUBLE PRECISION,
-        battery_percentage DOUBLE PRECISION,
-        charge_state BOOLEAN,
-        raw JSONB,
-        CONSTRAINT uq_device_time UNIQUE(device_id, recorded_at)
+        id SERIAL PRIMARY KEY, device_id TEXT, recorded_at TIMESTAMP NOT NULL,
+        air_quality_index TEXT, temp_current DOUBLE PRECISION, humidity_value DOUBLE PRECISION,
+        co2_value DOUBLE PRECISION, ch2o_value DOUBLE PRECISION, pm25_value DOUBLE PRECISION,
+        pm1 DOUBLE PRECISION, pm10 DOUBLE PRECISION, battery_percentage DOUBLE PRECISION,
+        charge_state BOOLEAN, raw JSONB, CONSTRAINT uq_device_time UNIQUE(device_id, recorded_at)
     );
-
     CREATE INDEX IF NOT EXISTS idx_metrics_device_time ON sensor_metrics(device_id, recorded_at DESC);
     """
     conn = None
     try:
-        conn = db_connect()
-        cur = conn.cursor()
-        cur.execute(create_sql)
-        conn.commit()
-        cur.close()
-        print("✅ Tablas verificadas/creadas en PostgreSQL.")
+        conn = db_connect(); cur = conn.cursor()
+        cur.execute(create_sql); conn.commit(); cur.close()
+        print("✅ Base de datos verificada.")
     except Exception as e:
-        print("⚠️ Error creando tablas:", e)
-        traceback.print_exc()
+        print("⚠️ Error DB:", e)
     finally:
-        if conn:
-            conn.close()
-
-def parse_recorded_at_from_response(resp):
-    ts_ms = resp.get("t")
-    try:
-        if isinstance(ts_ms, (int, float)):
-            return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
-    except Exception:
-        pass
-    return datetime.now(timezone.utc)
+        if conn: conn.close()
 
 CODE_TO_COLUMN = {
-    "air_quality_index": "air_quality_index",
-    "temp_current": "temp_current",
-    "humidity_value": "humidity_value",
-    "co2_value": "co2_value",
-    "ch2o_value": "ch2o_value",
-    "pm25_value": "pm25_value",
-    "pm1": "pm1",
-    "pm10": "pm10",
-    "battery_percentage": "battery_percentage",
+    "air_quality_index": "air_quality_index", "temp_current": "temp_current",
+    "humidity_value": "humidity_value", "co2_value": "co2_value",
+    "ch2o_value": "ch2o_value", "pm25_value": "pm25_value",
+    "pm1": "pm1", "pm10": "pm10", "battery_percentage": "battery_percentage",
     "charge_state": "charge_state"
 }
 
 def save_full_reading(device_id, full_data):
     conn = None
     try:
-        conn = db_connect()
-        cur = conn.cursor()
-        recorded_at = parse_recorded_at_from_response(full_data)
-
-        try:
-            recorded_at = recorded_at.astimezone(ZoneInfo("America/El_Salvador"))
-        except Exception:
-            pass
-
+        conn = db_connect(); cur = conn.cursor()
+        
+        # Procesar fecha
+        ts_ms = full_data.get("t", time.time() * 1000)
+        recorded_at = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).astimezone(ZoneInfo("America/El_Salvador"))
+        naive_dt = recorded_at.replace(tzinfo=None)
         raw_json = json.dumps(full_data, default=str)
 
-        cur.execute(
-            "INSERT INTO sensor_readings (device_id, recorded_at, raw) "
-            "VALUES (%s, %s, %s::jsonb) RETURNING id;",
-            (device_id, recorded_at.replace(tzinfo=None), raw_json)
-        )
+        # 1. Guardar en sensor_readings
+        cur.execute("INSERT INTO sensor_readings (device_id, recorded_at, raw) VALUES (%s, %s, %s::jsonb) RETURNING id;", (device_id, naive_dt, raw_json))
         reading_id = cur.fetchone()[0]
 
+        # 2. Mapear columnas para sensor_metrics
         cols = {col: None for col in CODE_TO_COLUMN.values()}
-        items = full_data.get("result") or []
-        for it in items:
+        for it in (full_data.get("result") or []):
             code = it.get("code")
-            if code not in CODE_TO_COLUMN:
-                continue
-            col = CODE_TO_COLUMN[code]
-            val = it.get("value")
-            if isinstance(val, bool):
-                cols[col] = val
-            elif isinstance(val, (int, float)):
-                cols[col] = float(val)
-            elif isinstance(val, str):
-                s = val.strip()
-                if s.lower() in ("true", "false"):
-                    cols[col] = (s.lower() == "true")
-                else:
-                    try:
-                        num = float(s)
-                        cols[col] = num
-                    except Exception:
-                        cols[col] = s
-            else:
-                cols[col] = None
+            if code in CODE_TO_COLUMN:
+                val = it.get("value")
+                cols[CODE_TO_COLUMN[code]] = float(val) if isinstance(val, (int, float)) else val
 
-        cur.execute(
-            """
-            INSERT INTO sensor_metrics
-              (device_id, recorded_at,
-               air_quality_index, temp_current, humidity_value, co2_value,
-               ch2o_value, pm25_value, pm1, pm10,
-               battery_percentage, charge_state, raw)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id;
-            """,
-            (
-                device_id, recorded_at.replace(tzinfo=None),
-                cols["air_quality_index"], cols["temp_current"], cols["humidity_value"], cols["co2_value"],
-                cols["ch2o_value"], cols["pm25_value"], cols["pm1"], cols["pm10"],
-                cols["battery_percentage"], cols["charge_state"], raw_json
-            )
-        )
+        cur.execute("""
+            INSERT INTO sensor_metrics (device_id, recorded_at, air_quality_index, temp_current, humidity_value, co2_value, 
+            ch2o_value, pm25_value, pm1, pm10, battery_percentage, charge_state, raw)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+        """, (device_id, naive_dt, cols["air_quality_index"], cols["temp_current"], cols["humidity_value"], cols["co2_value"],
+              cols["ch2o_value"], cols["pm25_value"], cols["pm1"], cols["pm10"], cols["battery_percentage"], cols["charge_state"], raw_json))
         metric_id = cur.fetchone()[0]
 
-        cur.execute(
-            """
-            INSERT INTO sensor_snapshot (device_id, last_recorded_at, raw)
-            VALUES (%s, %s, %s::jsonb)
-            ON CONFLICT (device_id) DO UPDATE
-              SET last_recorded_at = EXCLUDED.last_recorded_at,
-                  raw = EXCLUDED.raw;
-            """,
-            (device_id, recorded_at.replace(tzinfo=None), raw_json)
-        )
+        # 3. Snapshot
+        cur.execute("INSERT INTO sensor_snapshot (device_id, last_recorded_at, raw) VALUES (%s, %s, %s::jsonb) ON CONFLICT (device_id) DO UPDATE SET last_recorded_at = EXCLUDED.last_recorded_at, raw = EXCLUDED.raw;", (device_id, naive_dt, raw_json))
 
-        conn.commit()
-        cur.close()
-        return {
-            "success": True,
-            "reading_id": reading_id,
-            "metric_id": metric_id,
-            "recorded_at": recorded_at.strftime("%Y-%m-%d %H:%M:%S")
-        }
+        conn.commit(); cur.close()
+        return {"success": True, "reading_id": reading_id, "metric_id": metric_id, "recorded_at": naive_dt.isoformat()}
     except Exception as e:
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        traceback.print_exc()
+        if conn: conn.rollback()
         return {"success": False, "error": str(e)}
     finally:
-        if conn:
-            conn.close()
+        if conn: conn.close()
 
 # -------------------------
-# JOB periódico (cada 10 minutos)
+# JOB PERIÓDICO: Solo Cara Sucia
 # -------------------------
 SAVE_INTERVAL_SECONDS = 10 * 60
 
 def periodic_save_job():
     while True:
         try:
-            print("⏱️ Guardado periódico: obteniendo datos Tuya...")
-            data = get_tuya_data()
-            if "error" in data:
-                print("⚠️ Error al obtener datos Tuya:", data.get("error"))
-            else:
-                result = save_full_reading(DEVICE_ID, data)
-                if result.get("success"):
-                    print(
-                        f"✅ Guardado periódico: reading_id={result['reading_id']} "
-                        f"metric_id={result['metric_id']} at {result['recorded_at']}"
-                    )
-                else:
-                    print("⚠️ Error guardando (periódico):", result.get("error"))
+            print(f"⏱️ Job: Consultando estudio principal ({SENSORS_MAP[ID_CARA_SUCIA]})...")
+            data = get_tuya_data(ID_CARA_SUCIA)
+            if "error" not in data:
+                res = save_full_reading(ID_CARA_SUCIA, data)
+                print(f"✅ Guardado Cara Sucia: {res.get('metric_id')}" if res.get("success") else f"❌ Error: {res.get('error')}")
         except Exception as e:
-            print("⚠️ Excepción en periodic_save_job:", e)
-            traceback.print_exc()
+            print("⚠️ Error en Job:", e)
         time.sleep(SAVE_INTERVAL_SECONDS)
 
 # -------------------------
 # ENDPOINTS
 # -------------------------
 
-# NUEVO: Endpoint integrado desde FastAPI usando pandas
+@app.route('/api/sensors/realtime', methods=['GET'])
+def get_all_realtime():
+    """Muestra los 3 sensores en tiempo real sin guardar en base de datos."""
+    results = []
+    for dev_id, name in SENSORS_MAP.items():
+        data = get_tuya_data(dev_id)
+        results.append({
+            "name": name,
+            "device_id": dev_id,
+            "success": "error" not in data,
+            "data": data.get("result", []),
+            "error": data.get("error") if "error" in data else None
+        })
+    return jsonify({"timestamp": int(time.time()), "devices": results})
+
 @app.route('/api/metrics', methods=['GET'])
 def get_metrics():
-    """Obtiene los datos de sensor_metrics filtrados por fecha para las gráficas."""
-    # En Flask, los query params se obtienen de request.args
+    """Obtiene históricos de Cara Sucia."""
     start_date = request.args.get('start_date')
-    end_date = request.args.get('end_date')
     limit = request.args.get('limit', type=int)
-
     try:
         conn = db_connect()
-        
-        query = """
-            SELECT recorded_at, temp_current, humidity_value, co2_value, 
-                   ch2o_value, pm25_value, pm1, pm10, battery_percentage 
-            FROM sensor_metrics 
-            WHERE 1=1
-        """
-        params = []
-        
+        query = "SELECT recorded_at, temp_current, humidity_value, co2_value, pm25_value FROM sensor_metrics WHERE device_id = %s"
+        params = [ID_CARA_SUCIA]
         if start_date:
-            query += " AND recorded_at >= %s"
-            params.append(start_date)
-        if end_date:
-            query += " AND recorded_at <= %s"
-            params.append(end_date)
-            
-        if limit is not None:
-            query += f" ORDER BY recorded_at DESC LIMIT {limit}"
-            df = pd.read_sql(query, conn, params=params)
-            df = df.sort_values(by='recorded_at', ascending=True)
-        else:
-            query += " ORDER BY recorded_at ASC"
-            df = pd.read_sql(query, conn, params=params)
-            
+            query += " AND recorded_at >= %s"; params.append(start_date)
+        
+        query += " ORDER BY recorded_at " + ("DESC LIMIT " + str(limit) if limit else "ASC")
+        df = pd.read_sql(query, conn, params=params)
         conn.close()
         
-        if not df.empty:
-            df['recorded_at'] = pd.to_datetime(df['recorded_at']).dt.strftime('%Y-%m-%dT%H:%M:%S')
-        
+        if limit: df = df.sort_values(by='recorded_at', ascending=True)
+        df['recorded_at'] = pd.to_datetime(df['recorded_at']).dt.strftime('%Y-%m-%dT%H:%M:%S')
         return jsonify({"data": df.to_dict(orient='records')})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/api/sensors', methods=['GET'])
-def get_sensors():
-    return jsonify(get_tuya_data())
-
-@app.route('/api/sensors/formatted', methods=['GET'])
-def get_sensors_formatted():
-    data = get_tuya_data()
-    if 'error' in data:
-        return jsonify(data)
-
-    formatted_data = {
-        "success": True,
-        "timestamp": int(time.time()),
-        "sensors": []
-    }
-
-    sensor_names = {
-        'air_quality_index': 'Calidad del Aire',
-        'temp_current': 'Temperatura',
-        'humidity_value': 'Humedad',
-        'co2_value': 'CO₂',
-        'ch2o_value': 'Formaldehído',
-        'pm25_value': 'PM2.5',
-        'pm1': 'PM1.0',
-        'pm10': 'PM10',
-        'battery_percentage': 'Batería',
-        'charge_state': 'Estado de Carga'
-    }
-
-    if 'result' in data and data['result']:
-        for item in data['result']:
-            sensor = {
-                "code": item.get('code'),
-                "name": sensor_names.get(
-                    item.get('code'),
-                    item.get('code', '').replace('_', ' ').title()
-                ),
-                "value": item.get('value'),
-                "type": type(item.get('value')).__name__
-            }
-            formatted_data["sensors"].append(sensor)
-
-    return jsonify(formatted_data)
-
-@app.route('/api/token', methods=['GET'])
-def get_token_info():
-    global current_token, token_expires_at
-    if not current_token or not token_expires_at:
-        return jsonify({"status": "no_token", "message": "No hay token activo"})
-
-    now = datetime.now(timezone.utc)
-    is_valid = now < token_expires_at
-    time_remaining = (token_expires_at - now).total_seconds() if is_valid else 0
-
-    return jsonify({
-        "status": "active" if is_valid else "expired",
-        "expires_at": token_expires_at.isoformat(),
-        "time_remaining_seconds": int(time_remaining),
-        "is_valid": is_valid
-    })
-
-@app.route('/api/token/refresh', methods=['POST'])
-def refresh_token():
-    global current_token, token_expires_at
-    with token_lock:
-        current_token = None
-        token_expires_at = None
-
-    token_result = ensure_valid_token()
-    if "error" in token_result:
-        return jsonify({"success": False, "error": token_result["error"]}), 400
-
-    return jsonify({
-        "success": True,
-        "message": "Token renovado exitosamente",
-        "expires_at": token_expires_at.isoformat()
-    })
+@app.route('/api/save-now', methods=['POST'])
+def save_now():
+    """Fuerza guardado manual solo de Cara Sucia."""
+    data = get_tuya_data(ID_CARA_SUCIA)
+    if "error" in data: return jsonify(data), 500
+    return jsonify(save_full_reading(ID_CARA_SUCIA, data))
 
 @app.route('/api/health', methods=['GET'])
-def health_check():
-    global current_token, token_expires_at
-    token_status = "valid"
-    if not current_token:
-        token_status = "no_token"
-    elif not token_expires_at or datetime.now(timezone.utc) >= token_expires_at:
-        token_status = "expired"
-
-    return jsonify({
-        "status": "healthy",
-        "timestamp": int(time.time()),
-        "service": "Tuya Sensors API",
-        "token_status": token_status
-    })
-
-@app.route('/api/save-now', methods=['POST', 'GET'])
-def save_now():
-    data = get_tuya_data()
-    if "error" in data:
-        return jsonify({"success": False, "error": data.get("error")}), 500
-    result = save_full_reading(DEVICE_ID, data)
-    if result.get("success"):
-        return jsonify(result)
-    else:
-        return jsonify(result), 500
-
-@app.route('/api/latest-metrics', methods=['GET'])
-def latest_metrics():
-    device_id = request.args.get("device_id", DEVICE_ID)
-    try:
-        conn = db_connect()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(
-            """
-            SELECT * FROM sensor_metrics
-            WHERE device_id = %s
-            ORDER BY recorded_at DESC
-            LIMIT 1;
-            """,
-            (device_id,)
-        )
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        if not row:
-            return jsonify({"success": True, "device_id": device_id, "metrics": None})
-        if row.get("recorded_at"):
-            row["recorded_at"] = row["recorded_at"].strftime("%Y-%m-%d %H:%M:%S")
-        return jsonify({"success": True, "device_id": device_id, "metrics": row})
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/snapshots', methods=['GET'])
-def snapshots():
-    try:
-        conn = db_connect()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT device_id, last_recorded_at, raw FROM sensor_snapshot;")
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        for r in rows:
-            if r.get("last_recorded_at"):
-                r["last_recorded_at"] = r["last_recorded_at"].strftime("%Y-%m-%d %H:%M:%S")
-
-        return jsonify({"success": True, "snapshots": rows})
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/', methods=['GET'])
-def api_info():
-    return jsonify({
-        "name": "Tuya Sensors API",
-        "version": "2.1",
-        "features": [
-            "Renovación automática de tokens",
-            "Manejo thread-safe de tokens",
-            "Guardado en PostgreSQL (raw + columnar)",
-            "Job periódico cada 10 minutos",
-            "Consulta de métricas históricas filtradas"
-        ],
-        "endpoints": {
-            "/api/metrics": "Obtiene los datos históricos filtrados por fecha y límite para gráficas",
-            "/api/sensors": "Obtiene datos raw de sensores",
-            "/api/sensors/formatted": "Obtiene datos formateados de sensores",
-            "/api/token": "Información del token actual",
-            "/api/token/refresh": "Renueva el token manualmente",
-            "/api/health": "Estado de la API y token",
-            "/api/save-now": "Forza un guardado inmediato en BD",
-            "/api/latest-metrics": "Último registro columnar",
-            "/api/snapshots": "Último raw por dispositivo"
-        },
-        "usage": {
-            "cors": "Habilitado para todos los dominios",
-            "methods": ["GET", "POST"]
-        }
-    })
+def health():
+    return jsonify({"status": "healthy", "study_device": ID_CARA_SUCIA, "monitoring": list(SENSORS_MAP.values())})
 
 # -------------------------
-# Inicialización para Railway / Gunicorn
+# INICIO
 # -------------------------
 _initialized = False
-_init_lock = threading.Lock()
-
 def init_background():
     global _initialized
-    with _init_lock:
-        if _initialized:
-            return
-        print("🚀 Inicializando BD y job periódico...")
+    if not _initialized:
         create_tables_if_not_exist()
-
-        initial = ensure_valid_token()
-        if "error" in initial:
-            print("⚠️ No se pudo obtener token inicial:", initial["error"])
-        else:
-            print("✅ Token inicial obtenido")
-
-        t = threading.Thread(target=periodic_save_job, daemon=True)
-        t.start()
-        print(f"⏱️ Hilo de guardado periódico iniciado (cada {SAVE_INTERVAL_SECONDS} segundos)")
+        threading.Thread(target=periodic_save_job, daemon=True).start()
         _initialized = True
 
 init_background()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"Escuchando en puerto {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port)
