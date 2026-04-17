@@ -217,6 +217,7 @@ def get_metrics():
     limit = request.args.get('limit', type=int)
     from_date_str = request.args.get('start_date')
     to_date_str = request.args.get('end_date')
+    device_id = request.args.get('device_id', ID_CARA_SUCIA)
 
     from_date = None
     to_date = None
@@ -243,11 +244,12 @@ def get_metrics():
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
         query = """
-        SELECT recorded_at, temp_current, humidity_value, co2_value, pm25_value
+        SELECT recorded_at, temp_current, humidity_value, co2_value, 
+               ch2o_value, pm25_value, pm1, pm10, battery_percentage
         FROM sensor_metrics
         WHERE device_id = %s
         """
-        params = [ID_CARA_SUCIA]
+        params = [device_id]
 
         # Filtro por fechas
         if from_date:
@@ -273,7 +275,8 @@ def get_metrics():
             df = pd.DataFrame([dict(row) for row in rows])
             df = df.sort_values(by='recorded_at', ascending=True)
             df['recorded_at'] = pd.to_datetime(df['recorded_at']).dt.strftime('%Y-%m-%dT%H:%M:%S')
-            data = df.to_dict(orient='records')
+            # Limpiar valores NaN que hacen crashear a Flask jsonify
+            data = [{k: (v if pd.notna(v) else None) for k, v in row.items()} for row in df.to_dict(orient='records')]
         else:
             data = []
 
