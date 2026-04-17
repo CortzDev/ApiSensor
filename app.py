@@ -215,8 +215,8 @@ def get_all_realtime():
 @app.route('/api/metrics', methods=['GET'])
 def get_metrics():
     limit = request.args.get('limit', type=int)
-    from_date_str = request.args.get('from')
-    to_date_str = request.args.get('to')
+    from_date_str = request.args.get('start_date')
+    to_date_str = request.args.get('end_date')
 
     from_date = None
     to_date = None
@@ -281,6 +281,140 @@ def get_metrics():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/api/sensors', methods=['GET'])
+def get_sensors():
+    # Permite pasar el ID del dispositivo por URL, por defecto usa Cara Sucia
+    device_id = request.args.get("device_id", ID_CARA_SUCIA)
+    return jsonify(get_tuya_data(device_id))
+
+@app.route('/api/sensors/formatted', methods=['GET'])
+def get_sensors_formatted():
+    device_id = request.args.get("device_id", ID_CARA_SUCIA)
+    data = get_tuya_data(device_id)
+    if 'error' in data:
+        return jsonify(data)
+
+    formatted_data = {"success": True, "timestamp": int(time.time()), "sensors": []}
+    sensor_names = {
+        'air_quality_index': 'Calidad del Aire', 'temp_current': 'Temperatura',
+        'humidity_value': 'Humedad', 'co2_value': 'CO₂', 'ch2o_value': 'Formaldehído',
+        'pm25_value': 'PM2.5', 'pm1': 'PM1.0', 'pm10': 'PM10',
+        'battery_percentage': 'Batería', 'charge_state': 'Estado de Carga'
+    }
+
+    if 'result' in data and data['result']:
+        for item in data['result']:
+            sensor = {
+                "code": item.get('code'),
+                "name": sensor_names.get(item.get('code'), item.get('code', '').replace('_', ' ').title()),
+                "value": item.get('value'),
+                "type": type(item.get('value')).__name__
+            }
+            formatted_data["sensors"].append(sensor)
+
+    return jsonify(formatted_data)
+
+@app.route('/api/token', methods=['GET'])
+def get_token_info():
+    global current_token, token_expires_at
+    if not current_token or not token_expires_at:
+        return jsonify({"status": "no_token", "message": "No hay token activo"})
+
+    now = datetime.now(timezone.utc)
+    is_valid = now < token_expires_at
+    time_remaining = (token_expires_at - now).total_seconds() if is_valid else 0
+
+    return jsonify({
+        "status": "active" if is_valid else "expired",
+        "expires_at": token_expires_at.isoformat(),
+        "time_remaining_seconds": int(time_remaining),
+        "is_valid": is_valid
+    })
+
+@app.route('/api/token/refresh', methods=['POST'])
+def refresh_token():
+    global current_token, token_expires_at
+    with token_lock:
+        current_token = None
+        token_expires_at = None
+
+    token_result = ensure_valid_token()
+    if "error" in token_result:
+        return jsonify({"success": False, "error": token_result["error"]}), 400
+
+    return jsonify({"success": True, "message": "Token renovado exitosamente", "expires_at": token_expires_at.isoformat()})
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    global current_token, token_expires_at
+    token_status = "valid"
+    if not current_token:
+        token_status = "no_token"
+    elif not token_expires_at or datetime.now(timezone.utc) >= token_expires_at:
+        token_status = "expired"
+
+    return jsonify({
+        "status": "healthy", "timestamp": int(time.time()),
+        "service": "Tuya Sensors API Unified", "token_status": token_status
+    })
+
+@app.route('/api/save-now', methods=['POST', 'GET'])
+def save_now():
+    device_id = request.args.get("device_id", ID_CARA_SUCIA)
+    data = get_tuya_data(device_id)
+    if "error" in data:
+        return jsonify({"success": False, "error": data.get("error")}), 500
+    result = save_full_reading(device_id, data)
+    return jsonify(result), (200 if result.get("success") else 500)
+
+@app.route('/api/latest-metrics', methods=['GET'])
+def latest_metrics():
+    device_id = request.args.get("device_id", ID_CARA_SUCIA)
+    try:
+        conn = db_connect()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM sensor_metrics WHERE device_id = %s ORDER BY recorded_at DESC LIMIT 1;", (device_id,))
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if not row: return jsonify({"success": True, "device_id": device_id, "metrics": None})
+        if row.get("recorded_at"): row["recorded_at"] = row["recorded_at"].strftime("%Y-%m-%d %H:%M:%S")
+        return jsonify({"success": True, "device_id": device_id, "metrics": row})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/snapshots', methods=['GET'])
+def snapshots():
+    try:
+        conn = db_connect()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT device_id, last_recorded_at, raw FROM sensor_snapshot;")
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+        for r in rows:
+            if r.get("last_recorded_at"): r["last_recorded_at"] = r["last_recorded_at"].strftime("%Y-%m-%d %H:%M:%S")
+        return jsonify({"success": True, "snapshots": rows})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/', methods=['GET'])
+def api_info():
+    return jsonify({
+        "name": "Tuya Sensors API Unified",
+        "version": "2.6",
+        "endpoints": {
+            "/api/metrics": "Métricas históricas (soporta start_date y end_date)",
+            "/api/sensors/realtime": "Estado en tiempo real de todos los dispositivos",
+            "/api/sensors": "Obtiene datos raw de sensores",
+            "/api/sensors/formatted": "Obtiene datos formateados de sensores",
+            "/api/token": "Información del token actual",
+            "/api/token/refresh": "Renueva el token manualmente",
+            "/api/health": "Estado de la API y token",
+            "/api/save-now": "Fuerza un guardado inmediato en BD",
+            "/api/latest-metrics": "Último registro columnar",
+            "/api/snapshots": "Último raw por dispositivo"
+        }
+    })
 
 # -------------------------
 # INICIO
