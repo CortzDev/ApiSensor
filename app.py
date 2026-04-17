@@ -155,8 +155,13 @@ def save_full_reading(device_id, full_data):
                 if code == "charge_state":
                     # Fix: Convertimos 1.0, 1, o "true" a un Booleano real de Python
                     cols[CODE_TO_COLUMN[code]] = bool(val) if not isinstance(val, str) else val.lower() == "true"
+                elif code == "air_quality_index":
+                    cols[CODE_TO_COLUMN[code]] = str(val) if val is not None else None
                 else:
-                    cols[CODE_TO_COLUMN[code]] = float(val) if isinstance(val, (int, float)) else val
+                    try:
+                        cols[CODE_TO_COLUMN[code]] = float(val) if val is not None and str(val).strip() != "" else None
+                    except (ValueError, TypeError):
+                        cols[CODE_TO_COLUMN[code]] = None
 
         cur.execute("INSERT INTO sensor_readings (device_id, recorded_at, raw) VALUES (%s, %s, %s::jsonb) RETURNING id;", (device_id, naive_dt, raw_json))
         r_id = cur.fetchone()[0]
@@ -191,6 +196,8 @@ def periodic_save_job():
                 res = save_full_reading(ID_CARA_SUCIA, data)
                 if res.get("success"): print(f"✅ Metric ID: {res['metric_id']}")
                 else: print(f"❌ Error: {res['error']}")
+            else:
+                print(f"❌ Error Tuya: {data.get('error')}")
         except Exception as e: print(f"⚠️ Job Error: {e}")
         time.sleep(10 * 60)
 
@@ -208,11 +215,32 @@ def get_all_realtime():
 @app.route('/api/metrics', methods=['GET'])
 def get_metrics():
     limit = request.args.get('limit', type=int)
-    from_date = request.args.get('from')
-    to_date = request.args.get('to')
+    from_date_str = request.args.get('from')
+    to_date_str = request.args.get('to')
+
+    from_date = None
+    to_date = None
+
+    # Parseo robusto de fechas con compensación de zona horaria
+    try:
+        if from_date_str and from_date_str.strip():
+            dt = pd.to_datetime(from_date_str)
+            if pd.notna(dt):
+                if dt.tzinfo is not None:
+                    dt = dt.tz_convert('America/El_Salvador').tz_localize(None)
+                from_date = dt.strftime('%Y-%m-%d %H:%M:%S')
+        if to_date_str and to_date_str.strip():
+            dt = pd.to_datetime(to_date_str)
+            if pd.notna(dt):
+                if dt.tzinfo is not None:
+                    dt = dt.tz_convert('America/El_Salvador').tz_localize(None)
+                to_date = dt.strftime('%Y-%m-%d %H:%M:%S')
+    except Exception as e:
+        return jsonify({"error": f"Formato de fecha inválido: {e}"}), 400
 
     try:
         conn = db_connect()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
         query = """
         SELECT recorded_at, temp_current, humidity_value, co2_value, pm25_value
@@ -236,13 +264,20 @@ def get_metrics():
             query += " LIMIT %s"
             params.append(limit)
 
-        df = pd.read_sql(query, conn, params=params)
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        cur.close()
         conn.close()
 
-        df = df.sort_values(by='recorded_at', ascending=True)
-        df['recorded_at'] = pd.to_datetime(df['recorded_at']).dt.strftime('%Y-%m-%dT%H:%M:%S')
+        if rows:
+            df = pd.DataFrame([dict(row) for row in rows])
+            df = df.sort_values(by='recorded_at', ascending=True)
+            df['recorded_at'] = pd.to_datetime(df['recorded_at']).dt.strftime('%Y-%m-%dT%H:%M:%S')
+            data = df.to_dict(orient='records')
+        else:
+            data = []
 
-        return jsonify({"data": df.to_dict(orient='records')})
+        return jsonify({"data": data})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
