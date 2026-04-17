@@ -1,6 +1,6 @@
 # app.py
 # API unificada: Tuya IoT + Background Jobs (Estudio Cara Sucia) + Real-time (Nahuizalco/Juayúa)
-# Versión: 2.6 - Fix Parseo de Fechas para Frontend y Fix Boolean Cast para PostgreSQL
+# Versión: 2.7 - Fix Railway Background Thread & Timestamp Unique Constraint
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -139,12 +139,15 @@ CODE_TO_COLUMN = {
 
 def save_full_reading(device_id, full_data):
     conn = None
-    device_id = ID_CARA_SUCIA  # Forzamos el guardado solo para Cara Sucia, el estudio principal
+    device_id = ID_CARA_SUCIA  # Forzamos el guardado solo para Cara Sucia
     try:
         conn = db_connect(); cur = conn.cursor()
-        ts_ms = full_data.get("t", time.time() * 1000)
-        recorded_at = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).astimezone(ZoneInfo("America/El_Salvador"))
+        
+        # FIX APLICADO AQUÍ: Tomar la hora actual del servidor para que nunca choque 
+        # con la base de datos por culpa de datos repetidos de Tuya
+        recorded_at = datetime.now(ZoneInfo("America/El_Salvador"))
         naive_dt = recorded_at.replace(tzinfo=None)
+        
         raw_json = json.dumps(full_data, default=str)
 
         # Mapeo de columnas con FIX para booleano
@@ -180,6 +183,7 @@ def save_full_reading(device_id, full_data):
         return {"success": True, "reading_id": r_id, "metric_id": m_id}
     except Exception as e:
         if conn: conn.rollback()
+        print(f"❌ Error DB en guardado: {e}")
         return {"success": False, "error": str(e)}
     finally:
         if conn: conn.close()
@@ -194,8 +198,8 @@ def periodic_save_job():
             data = get_tuya_data(ID_CARA_SUCIA)
             if "error" not in data:
                 res = save_full_reading(ID_CARA_SUCIA, data)
-                if res.get("success"): print(f"✅ Metric ID: {res['metric_id']}")
-                else: print(f"❌ Error: {res['error']}")
+                if res.get("success"): print(f"✅ Registrado exitosamente. ID: {res['metric_id']}")
+                else: print(f"❌ Error al guardar en BD: {res['error']}")
             else:
                 print(f"❌ Error Tuya: {data.get('error')}")
         except Exception as e: print(f"⚠️ Job Error: {e}")
@@ -222,7 +226,6 @@ def get_metrics():
     from_date = None
     to_date = None
 
-    # Parseo robusto de fechas adaptado para el input datetime-local de React
     try:
         if from_date_str and from_date_str.strip():
             dt = pd.to_datetime(from_date_str)
@@ -256,7 +259,6 @@ def get_metrics():
         """
         params = [device_id]
 
-        # Filtro por fechas
         if from_date:
             query += " AND recorded_at >= %s"
             params.append(from_date)
@@ -280,7 +282,6 @@ def get_metrics():
             df = pd.DataFrame([dict(row) for row in rows])
             df = df.sort_values(by='recorded_at', ascending=True)
             df['recorded_at'] = pd.to_datetime(df['recorded_at']).dt.strftime('%Y-%m-%dT%H:%M:%S')
-            # Limpiar valores NaN que hacen crashear a Flask jsonify
             data = [{k: (v if pd.notna(v) else None) for k, v in row.items()} for row in df.to_dict(orient='records')]
         else:
             data = []
@@ -292,7 +293,6 @@ def get_metrics():
 
 @app.route('/api/sensors', methods=['GET'])
 def get_sensors():
-    # Permite pasar el ID del dispositivo por URL, por defecto usa Cara Sucia
     device_id = request.args.get("device_id", ID_CARA_SUCIA)
     return jsonify(get_tuya_data(device_id))
 
@@ -409,7 +409,7 @@ def snapshots():
 def api_info():
     return jsonify({
         "name": "Tuya Sensors API Unified",
-        "version": "2.6",
+        "version": "2.7",
         "endpoints": {
             "/api/metrics": "Métricas históricas (soporta start_date y end_date)",
             "/api/sensors/realtime": "Estado en tiempo real de todos los dispositivos",
@@ -425,10 +425,17 @@ def api_info():
     })
 
 # -------------------------
-# INICIO
+# INICIO AUTOMÁTICO (Fix para Railway/Gunicorn)
 # -------------------------
-if __name__ == "__main__":
-    create_tables_if_not_exist()
+# 1. Aseguramos que las tablas existan (fuera del main)
+create_tables_if_not_exist()
+
+# 2. Iniciamos el hilo de guardado globalmente para que Gunicorn no lo ignore
+if not os.environ.get("WERKZEUG_RUN_MAIN") == "true": 
+    print("🚀 Iniciando hilo de guardado en segundo plano...")
     threading.Thread(target=periodic_save_job, daemon=True).start()
+
+# Esto solo se corre si pruebas localmente con 'python app.py'
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
