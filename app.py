@@ -1,6 +1,6 @@
 # app.py
 # API unificada: Tuya IoT + Background Jobs (Estudio Cara Sucia) + Real-time (Nahuizalco/Juayúa)
-# Versión: 2.5 - Fix Boolean Cast para PostgreSQL
+# Versión: 2.6 - Fix Parseo de Fechas para Frontend y Fix Boolean Cast para PostgreSQL
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -153,7 +153,6 @@ def save_full_reading(device_id, full_data):
             if code in CODE_TO_COLUMN:
                 val = it.get("value")
                 if code == "charge_state":
-                    # Fix: Convertimos 1.0, 1, o "true" a un Booleano real de Python
                     cols[CODE_TO_COLUMN[code]] = bool(val) if not isinstance(val, str) else val.lower() == "true"
                 elif code == "air_quality_index":
                     cols[CODE_TO_COLUMN[code]] = str(val) if val is not None else None
@@ -222,20 +221,25 @@ def get_metrics():
     from_date = None
     to_date = None
 
-    # Parseo robusto de fechas con compensación de zona horaria
+    # Parseo robusto de fechas adaptado para el input datetime-local de React
     try:
         if from_date_str and from_date_str.strip():
             dt = pd.to_datetime(from_date_str)
             if pd.notna(dt):
-                if dt.tzinfo is not None:
-                    dt = dt.tz_convert('America/El_Salvador').tz_localize(None)
-                from_date = dt.strftime('%Y-%m-%d %H:%M:%S')
+                if dt.tzinfo is None:
+                    dt = dt.tz_localize('America/El_Salvador')
+                else:
+                    dt = dt.tz_convert('America/El_Salvador')
+                from_date = dt.tz_localize(None).strftime('%Y-%m-%d %H:%M:%S')
+                
         if to_date_str and to_date_str.strip():
             dt = pd.to_datetime(to_date_str)
             if pd.notna(dt):
-                if dt.tzinfo is not None:
-                    dt = dt.tz_convert('America/El_Salvador').tz_localize(None)
-                to_date = dt.strftime('%Y-%m-%d %H:%M:%S')
+                if dt.tzinfo is None:
+                    dt = dt.tz_localize('America/El_Salvador')
+                else:
+                    dt = dt.tz_convert('America/El_Salvador')
+                to_date = dt.tz_localize(None).strftime('%Y-%m-%d %H:%M:%S')
     except Exception as e:
         return jsonify({"error": f"Formato de fecha inválido: {e}"}), 400
 
