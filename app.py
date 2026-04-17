@@ -139,6 +139,7 @@ CODE_TO_COLUMN = {
 
 def save_full_reading(device_id, full_data):
     conn = None
+    device_id = ID_CARA_SUCIA  # Forzamos el guardado solo para Cara Sucia, el estudio principal
     try:
         conn = db_connect(); cur = conn.cursor()
         ts_ms = full_data.get("t", time.time() * 1000)
