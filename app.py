@@ -208,19 +208,44 @@ def get_all_realtime():
 @app.route('/api/metrics', methods=['GET'])
 def get_metrics():
     limit = request.args.get('limit', type=int)
+    from_date = request.args.get('from')
+    to_date = request.args.get('to')
+
     try:
         conn = db_connect()
-        query = f"SELECT recorded_at, temp_current, humidity_value, co2_value, pm25_value FROM sensor_metrics WHERE device_id = '{ID_CARA_SUCIA}' ORDER BY recorded_at DESC"
-        if limit: query += f" LIMIT {limit}"
-        df = pd.read_sql(query, conn)
+
+        query = """
+        SELECT recorded_at, temp_current, humidity_value, co2_value, pm25_value
+        FROM sensor_metrics
+        WHERE device_id = %s
+        """
+        params = [ID_CARA_SUCIA]
+
+        # Filtro por fechas
+        if from_date:
+            query += " AND recorded_at >= %s"
+            params.append(from_date)
+
+        if to_date:
+            query += " AND recorded_at <= %s"
+            params.append(to_date)
+
+        query += " ORDER BY recorded_at DESC"
+
+        if limit:
+            query += " LIMIT %s"
+            params.append(limit)
+
+        df = pd.read_sql(query, conn, params=params)
         conn.close()
+
         df = df.sort_values(by='recorded_at', ascending=True)
         df['recorded_at'] = pd.to_datetime(df['recorded_at']).dt.strftime('%Y-%m-%dT%H:%M:%S')
-        return jsonify({"data": df.to_dict(orient='records')})
-    except Exception as e: return jsonify({"error": str(e)}), 500
 
-@app.route('/api/health', methods=['GET'])
-def health(): return jsonify({"status": "online", "sensors": list(SENSORS_MAP.values())})
+        return jsonify({"data": df.to_dict(orient='records')})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # -------------------------
 # INICIO
